@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Session map: visualize what Claude touched in this session."""
 
-import sys, json, os, re, subprocess
+import sys, json, os, re, subprocess, math, base64, time
 
 # ---------------------------------------------------------------------------
 # Config
@@ -15,16 +15,35 @@ SENSITIVE = [
 
 SAFE_PREFIXES = ['/tmp/', '/var/', '/private/tmp/', '/private/var/']
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
 
 scope_override = None
+mode = 'terminal'  # terminal | html | live
+idle_timeout = 120  # seconds; 0 = never auto-shutdown
 args = sys.argv[1:]
 i = 0
 while i < len(args):
     if args[i] == '--scope' and i + 1 < len(args):
         scope_override = os.path.abspath(args[i + 1])
+        i += 2
+    elif args[i] == '--html':
+        mode = 'html'
+        i += 1
+    elif args[i] == '--live':
+        mode = 'live'
+        i += 1
+    elif args[i] == '--timeout' and i + 1 < len(args):
+        try:
+            idle_timeout = int(args[i + 1])
+            if idle_timeout < 0:
+                raise ValueError
+        except ValueError:
+            print(f'--timeout must be a non-negative integer, got: {args[i + 1]}')
+            sys.exit(1)
         i += 2
     else:
         i += 1
@@ -42,19 +61,22 @@ if not os.path.isdir(project_dir):
     print(f'No session found for {cwd}. Have you run a Claude Code session here?')
     sys.exit(1)
 
-jsonl_files = []
-for f in os.listdir(project_dir):
-    fp = os.path.join(project_dir, f)
-    if f.endswith('.jsonl') and os.path.isfile(fp):
-        jsonl_files.append((fp, os.path.getmtime(fp)))
+def find_latest_session():
+    jsonl_files = []
+    for f in os.listdir(project_dir):
+        fp = os.path.join(project_dir, f)
+        if f.endswith('.jsonl') and os.path.isfile(fp):
+            jsonl_files.append((fp, os.path.getmtime(fp)))
+    if not jsonl_files:
+        return None, None
+    jsonl_files.sort(key=lambda x: x[1], reverse=True)
+    fp = jsonl_files[0][0]
+    return fp, os.path.basename(fp).replace('.jsonl', '')
 
-if not jsonl_files:
+session_file, session_id = find_latest_session()
+if not session_file:
     print(f'No session files in {project_dir}.')
     sys.exit(1)
-
-jsonl_files.sort(key=lambda x: x[1], reverse=True)
-session_file = jsonl_files[0][0]
-session_id = os.path.basename(session_file).replace('.jsonl', '')
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -107,15 +129,6 @@ def is_safe_dir(p):
 
 claude_prefix = os.path.join(home, '.claude/')
 
-def track_file(path, activity):
-    if not is_real_path(path):
-        return
-    if path.startswith(claude_prefix):
-        return
-    if path not in files:
-        files[path] = {'reads': 0, 'writes': 0, 'creates': 0, 'deletes': 0}
-    files[path][activity] += 1
-
 def plural(n, word):
     return f'{n} {word}' if n == 1 else f'{n} {word}s'
 
@@ -124,184 +137,593 @@ def rel_path(p):
         return p[len(cwd) + 1:]
     return p
 
+def escape_html(s):
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
+
+def file_sym(act):
+    if act.get('isSensitive'):
+        return '\u26a0'
+    if act.get('creates', 0) > 0:
+        return '+'
+    if act.get('deletes', 0) > 0:
+        return '-'
+    if act.get('writes', 0) > 0:
+        return '\u25cf'
+    return '\u25cb'
+
 # ---------------------------------------------------------------------------
 # Parse session
 # ---------------------------------------------------------------------------
 
-files = {}
-tools = {}
-web = {}
-total_calls = 0
+def parse_session(sf):
+    files = {}
+    tools = {}
+    web = {}
+    total_calls = 0
+    first_user_message = None
 
-for line in open(session_file, encoding='utf-8', errors='replace'):
-    line = line.strip()
-    if not line:
-        continue
+    def track_file(path, activity):
+        if not is_real_path(path):
+            return
+        if path.startswith(claude_prefix):
+            return
+        if path not in files:
+            sens = is_sensitive(path)
+            files[path] = {
+                'reads': 0, 'writes': 0, 'creates': 0, 'deletes': 0,
+                'isSensitive': bool(sens), 'sensitiveReason': sens or None,
+            }
+        files[path][activity] += 1
+
+    def track_web(domain, url):
+        web.setdefault(domain, {'count': 0, 'urls': []})
+        web[domain]['count'] += 1
+        if url not in web[domain]['urls']:
+            web[domain]['urls'].append(url)
+
+    def extract_domain(url):
+        try:
+            return url.split('//')[1].split('/')[0]
+        except Exception:
+            return url
+
+    with open(sf, encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+
+            # Extract first user message as session topic
+            if record.get('type') == 'user' and first_user_message is None:
+                msg = record.get('message', {})
+                if isinstance(msg, dict):
+                    content = msg.get('content', '')
+                    if isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get('type') == 'text':
+                                first_user_message = c.get('text', '')
+                                break
+                    elif isinstance(content, str):
+                        first_user_message = content
+
+            if record.get('type') != 'assistant':
+                continue
+            content = record.get('message', {}).get('content', [])
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get('type') != 'tool_use':
+                    continue
+                name = item.get('name', '')
+                inp = item.get('input', {})
+                total_calls += 1
+                tools[name] = tools.get(name, 0) + 1
+
+                if name in ('Read', 'Glob', 'Grep'):
+                    p = inp.get('file_path') or inp.get('path', '')
+                    track_file(p, 'reads')
+                elif name == 'Write':
+                    p = inp.get('file_path', '')
+                    if is_real_path(p):
+                        already = p in files
+                        exists = not already and os.path.exists(p)
+                        track_file(p, 'writes' if (already or exists) else 'creates')
+                elif name in ('Edit', 'MultiEdit'):
+                    track_file(inp.get('file_path', ''), 'writes')
+                elif name == 'Bash':
+                    cmd = inp.get('command', '')
+                    for m in re.finditer(r'>{1,2}\s*((?:/|\.\.?/)[^\s;|&]+)', cmd):
+                        track_file(m.group(1), 'writes')
+                    if re.search(r'\brm\b', cmd):
+                        for m in re.finditer(r'\brm\s+(?:-[a-zA-Z]+\s+)*((?:/|\.\.?/)[^\s;|&]+)', cmd):
+                            track_file(m.group(1), 'deletes')
+                    for m in re.finditer(r'https?://[^\s\'"<>]+', cmd):
+                        url = m.group(0).rstrip(')')
+                        track_web(extract_domain(url), url)
+                elif name == 'WebFetch':
+                    url = inp.get('url', '')
+                    if url:
+                        track_web(extract_domain(url), url)
+                elif name == 'WebSearch':
+                    q = inp.get('query', '')
+                    if q:
+                        track_web('web-search', q)
+
+    # Truncate to first line, cap at 80 chars for display
+    session_topic = None
+    if first_user_message:
+        topic = first_user_message.strip().split('\n')[0]
+        session_topic = (topic[:77] + '...') if len(topic) > 80 else topic
+
+    return files, tools, web, total_calls, session_topic
+
+# ---------------------------------------------------------------------------
+# Blast radius calculation
+# ---------------------------------------------------------------------------
+
+def calc_blast_radius(files, cached_project_count=None):
+    if cached_project_count is not None:
+        total_project = cached_project_count
+    else:
+        try:
+            result = subprocess.run(['git', 'ls-files'], capture_output=True, text=True, cwd=cwd)
+            total_project = len([l for l in result.stdout.strip().split('\n') if l]) if result.returncode == 0 else 0
+        except Exception:
+            total_project = 0
+
+        if total_project == 0:
+            try:
+                result = subprocess.run(
+                    ['find', '.', '-type', 'f', '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.*'],
+                    capture_output=True, text=True, cwd=cwd
+                )
+                total_project = len([l for l in result.stdout.strip().split('\n') if l])
+            except Exception:
+                total_project = 1
+
+        if total_project == 0:
+            total_project = 1
+
+    touched = len(files)
+    raw_score = round((touched / total_project) * 10)
+    score = max(1, min(10, raw_score))
+
+    sensitive = [p for p, act in files.items() if act.get('isSensitive')]
+
+    scope_val = scope_override or cwd
+    if not scope_val.endswith('/'):
+        scope_val += '/'
+    drift = []
+    for p in files:
+        resolved = p if p.startswith('/') else os.path.join(cwd, p)
+        if not resolved.startswith(scope_val) and resolved != scope_val.rstrip('/'):
+            if not is_safe_dir(resolved) and not resolved.startswith(claude_prefix):
+                drift.append(p)
+
+    return score, total_project, touched, sensitive, drift, scope_val
+
+# ---------------------------------------------------------------------------
+# HTML generation
+# ---------------------------------------------------------------------------
+
+def _make_activity_entry(path, act):
+    """Build the activity dict used by both file list and treemap."""
+    return {
+        'path': path,
+        'reads': act['reads'],
+        'writes': act['writes'],
+        'creates': act['creates'],
+        'deletes': act['deletes'],
+        'isSensitive': act.get('isSensitive', False),
+        'sensitiveReason': act.get('sensitiveReason'),
+    }
+
+def build_file_tree(files):
+    """Build a nested tree structure for the D3 treemap."""
+    root = {'name': 'root', 'children': []}
+
+    for file_path, activity in files.items():
+        parts = [s for s in file_path.split('/') if s]
+        current = root
+
+        for idx, part in enumerate(parts):
+            is_leaf = idx == len(parts) - 1
+            if is_leaf:
+                if 'children' not in current:
+                    current['children'] = []
+                entry = _make_activity_entry(file_path, activity)
+                raw = activity['reads'] + activity['writes'] * 2 + activity['creates'] * 3 + activity['deletes'] * 3
+                current['children'].append({
+                    'name': part,
+                    'path': file_path,
+                    'activity': entry,
+                    'value': max(1, math.sqrt(raw)),
+                })
+            else:
+                if 'children' not in current:
+                    current['children'] = []
+                child = None
+                for c in current['children']:
+                    if c.get('name') == part and 'children' in c:
+                        child = c
+                        break
+                if not child:
+                    child = {'name': part, 'children': []}
+                    current['children'].append(child)
+                current = child
+
+    return root
+
+def serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None):
+    """Serialize session data into the format expected by the HTML template."""
+    file_activity = [_make_activity_entry(path, act) for path, act in files.items()]
+
+    web_activity = []
+    for domain, info in web.items():
+        web_activity.append({
+            'domain': domain,
+            'urls': info['urls'],
+            'count': info['count'],
+        })
+
+    return {
+        'sessionId': session_id,
+        'sessionFile': session_file,
+        'cwd': cwd,
+        'totalToolCalls': total_calls,
+        'malformedLines': 0,
+        'fileActivity': file_activity,
+        'webActivity': web_activity,
+        'toolBreakdown': tools,
+        'homeDir': home,
+        'blast': {
+            'score': score,
+            'totalProjectFiles': total_project,
+            'touchedFiles': touched,
+            'sensitiveFiles': sensitive,
+            'scopeDriftFiles': drift,
+            'inferredScope': scope_val.rstrip('/'),
+        },
+        'generatedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'tree': build_file_tree(files),
+        'sessionTopic': topic,
+    }
+
+def blast_color_var(score):
+    if score <= 3:
+        return 'var(--created)'
+    if score <= 6:
+        return 'var(--modified)'
+    return 'var(--deleted)'
+
+def blast_desc(score):
+    if score <= 3:
+        return 'Minimal'
+    if score <= 6:
+        return 'Moderate'
+    if score <= 8:
+        return 'Significant'
+    return 'High'
+
+def generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=False, topic=None):
+    """Generate the HTML report by reading template and substituting data."""
+    template_path = os.path.join(SCRIPT_DIR, 'template.html')
+    with open(template_path, 'r') as f:
+        template = f.read()
+
+    data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic)
+    data_json = json.dumps(data, default=str)
+    data_b64 = base64.b64encode(data_json.encode('utf-8')).decode('ascii')
+
+    sid_display = escape_html(session_id[:8] + '...') if len(session_id) > 8 else escape_html(session_id)
+
+    html = template.replace('{{DATA_B64}}', data_b64)
+    html = html.replace('{{SESSION_ID}}', sid_display)
+    html = html.replace('{{BLAST_COLOR}}', escape_html(blast_color_var(score)))
+    html = html.replace('{{BLAST_DESC}}', escape_html(blast_desc(score)))
+    html = html.replace('{{CWD}}', escape_html(cwd))
+    html = html.replace('{{GENERATED_AT}}', escape_html(data['generatedAt']))
+
+    if live:
+        # Inject the flag that activates SSE in the client JS
+        html = html.replace('var SESSION_DATA =', 'window.SESSION_MAP_LIVE = true;\nvar SESSION_DATA =')
+
+    return html
+
+# ---------------------------------------------------------------------------
+# Live server (stdlib only)
+# ---------------------------------------------------------------------------
+
+# Idle timeout is set via --timeout flag (default 120s, 0 = disabled)
+
+def _pidfile_path():
+    """Return path to the PID file for the current project directory."""
+    return os.path.join(project_dir, '.session-map-live.pid')
+
+def _read_pidfile():
+    """Read PID file. Returns (pid, port) or (None, None)."""
+    pf = _pidfile_path()
+    if not os.path.exists(pf):
+        return None, None
     try:
-        record = json.loads(line)
+        with open(pf) as f:
+            data = json.load(f)
+        return data.get('pid'), data.get('port')
     except Exception:
-        continue
-    if record.get('type') != 'assistant':
-        continue
-    content = record.get('message', {}).get('content', [])
-    if not isinstance(content, list):
-        continue
-    for item in content:
-        if not isinstance(item, dict) or item.get('type') != 'tool_use':
+        return None, None
+
+def _write_pidfile(pid, port):
+    pf = _pidfile_path()
+    with open(pf, 'w') as f:
+        json.dump({'pid': pid, 'port': port, 'cwd': cwd, 'session': session_file}, f)
+
+def _remove_pidfile():
+    pf = _pidfile_path()
+    try:
+        os.unlink(pf)
+    except OSError:
+        pass
+
+def _is_process_alive(pid):
+    """Check if a process with given PID is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+def _check_existing_server():
+    """Check if a live server is already running for this project.
+    Returns the URL if reusable, None otherwise."""
+    pid, port = _read_pidfile()
+    if pid is None:
+        return None
+    if not _is_process_alive(pid):
+        _remove_pidfile()
+        return None
+    # Server is alive — verify it's actually responding
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(f'http://127.0.0.1:{port}/', timeout=2)
+        resp.read()
+        return f'http://127.0.0.1:{port}'
+    except Exception:
+        # Process exists but not responding on that port — stale
+        _remove_pidfile()
+        return None
+
+def start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None):
+    """Start a live-updating HTTP server using only Python stdlib."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading, signal
+
+    # Check for existing server first
+    existing_url = _check_existing_server()
+    if existing_url:
+        print(f'Live server already running: {existing_url}')
+        print('Reusing existing server (refresh the browser tab).')
+        # Open the browser to the existing server
+        open_cmd = 'xdg-open' if sys.platform == 'linux' else 'open'
+        try:
+            subprocess.Popen([open_cmd, existing_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        return
+
+    current_html = [generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=True, topic=topic)]
+    subscribers = []
+    subscribers_lock = threading.Lock()
+    shutdown_event = threading.Event()
+    session_ended = [False]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # suppress request logs
+
+        def do_GET(self):
+            if self.path == '/':
+                content = current_html[0].encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+            elif self.path == '/events':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'keep-alive')
+                self.send_header('X-Accel-Buffering', 'no')
+                self.end_headers()
+
+                event = threading.Event()
+                with subscribers_lock:
+                    subscribers.append(event)
+                try:
+                    while not shutdown_event.is_set():
+                        fired = event.wait(timeout=25)
+                        if fired:
+                            event.clear()
+                            try:
+                                if session_ended[0]:
+                                    self.wfile.write(b'event: session-ended\ndata: {}\n\n')
+                                else:
+                                    self.wfile.write(f'data: {{"timestamp": {int(time.time())}}}\n\n'.encode())
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                break
+                            if session_ended[0]:
+                                break
+                        else:
+                            # SSE keepalive — prevents browser from closing idle connections
+                            try:
+                                self.wfile.write(b': keepalive\n\n')
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                break
+                except Exception:
+                    pass
+                finally:
+                    with subscribers_lock:
+                        if event in subscribers:
+                            subscribers.remove(event)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    # Find available port (start at 7377 to avoid common dev server ports)
+    port = 7377
+    server = None
+    for p in range(7377, 7388):
+        try:
+            server = HTTPServer(('127.0.0.1', p), Handler)
+            port = p
+            break
+        except OSError:
             continue
-        name = item.get('name', '')
-        inp = item.get('input', {})
-        total_calls += 1
-        tools[name] = tools.get(name, 0) + 1
 
-        if name in ('Read', 'Glob', 'Grep'):
-            p = inp.get('file_path') or inp.get('path', '')
-            track_file(p, 'reads')
-        elif name == 'Write':
-            p = inp.get('file_path', '')
-            if is_real_path(p):
-                already = p in files
-                exists = not already and os.path.exists(p)
-                track_file(p, 'writes' if (already or exists) else 'creates')
-        elif name in ('Edit', 'MultiEdit'):
-            track_file(inp.get('file_path', ''), 'writes')
-        elif name == 'Bash':
-            cmd = inp.get('command', '')
-            for m in re.finditer(r'>{1,2}\s*((?:/|\.\.?/)[^\s;|&]+)', cmd):
-                track_file(m.group(1), 'writes')
-            if re.search(r'\brm\b', cmd):
-                for m in re.finditer(r'\brm\s+(?:-[a-zA-Z]+\s+)*((?:/|\.\.?/)[^\s;|&]+)', cmd):
-                    track_file(m.group(1), 'deletes')
-            for m in re.finditer(r'https?://[^\s\'"<>]+', cmd):
-                url = m.group(0).rstrip(')')
-                try:
-                    domain = url.split('//')[1].split('/')[0]
-                except Exception:
-                    domain = url
-                web.setdefault(domain, {'count': 0, 'urls': []})
-                web[domain]['count'] += 1
-                if url not in web[domain]['urls']:
-                    web[domain]['urls'].append(url)
-        elif name == 'WebFetch':
-            url = inp.get('url', '')
-            if url:
-                try:
-                    domain = url.split('//')[1].split('/')[0]
-                except Exception:
-                    domain = url
-                web.setdefault(domain, {'count': 0, 'urls': []})
-                web[domain]['count'] += 1
-                if url not in web[domain]['urls']:
-                    web[domain]['urls'].append(url)
-        elif name == 'WebSearch':
-            q = inp.get('query', '')
-            if q:
-                web.setdefault('web-search', {'count': 0, 'urls': []})
-                web['web-search']['count'] += 1
-                web['web-search']['urls'].append(q)
+    if not server:
+        print('No available ports in range 7377-7387')
+        sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# Blast radius
-# ---------------------------------------------------------------------------
+    # Write PID file so future invocations can find us
+    _write_pidfile(os.getpid(), port)
 
-try:
-    result = subprocess.run(['git', 'ls-files'], capture_output=True, text=True, cwd=cwd)
-    total_project = len([l for l in result.stdout.strip().split('\n') if l]) if result.returncode == 0 else 0
-except Exception:
-    total_project = 0
+    # Cache project file count — doesn't change mid-session
+    cached_total_project = [total_project]
 
-if total_project == 0:
+    # File watcher thread with session-end detection
+    last_mtime = [os.path.getmtime(session_file)]
+    last_change_time = [time.time()]
+
+    def watch_file():
+        while not shutdown_event.is_set():
+            time.sleep(1)
+            try:
+                # Check if session file still exists
+                if not os.path.exists(session_file):
+                    print('Session file removed. Shutting down.')
+                    session_ended[0] = True
+                    shutdown_event.set()
+                    with subscribers_lock:
+                        for event in subscribers:
+                            event.set()
+                    server.shutdown()
+                    return
+
+                mtime = os.path.getmtime(session_file)
+                if mtime > last_mtime[0]:
+                    last_mtime[0] = mtime
+                    last_change_time[0] = time.time()
+                    # Re-parse and regenerate (reuse cached project file count)
+                    f, t, w, tc, _topic = parse_session(session_file)
+                    s, tp, tch, sens, dr, sv = calc_blast_radius(f, cached_project_count=cached_total_project[0])
+                    current_html[0] = generate_html(f, t, w, tc, s, tp, tch, sens, dr, sv, live=True)
+                    # Notify all SSE subscribers
+                    with subscribers_lock:
+                        for event in subscribers:
+                            event.set()
+                elif idle_timeout > 0:
+                    # Check for idle timeout (session likely ended)
+                    idle_seconds = time.time() - last_change_time[0]
+                    if idle_seconds > idle_timeout:
+                        print(f'No session activity for {idle_timeout}s. Auto-shutting down.')
+                        session_ended[0] = True
+                        shutdown_event.set()
+                        with subscribers_lock:
+                            for event in subscribers:
+                                event.set()
+                        server.shutdown()
+                        return
+            except Exception:
+                pass
+
+    watcher = threading.Thread(target=watch_file, daemon=True)
+    watcher.start()
+
+    # Open browser
+    url = f'http://127.0.0.1:{port}'
+    open_cmd = 'xdg-open' if sys.platform == 'linux' else 'open'
     try:
-        result = subprocess.run(
-            ['find', '.', '-type', 'f', '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.*'],
-            capture_output=True, text=True, cwd=cwd
-        )
-        total_project = len([l for l in result.stdout.strip().split('\n') if l])
+        subprocess.Popen([open_cmd, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        total_project = 1
+        pass
 
-if total_project == 0:
-    total_project = 1
+    print(f'Live mode: {url}')
+    if idle_timeout > 0:
+        print(f'Auto-stops after {idle_timeout}s of inactivity. Use --timeout 0 to disable.')
+    else:
+        print('Auto-shutdown disabled. Ctrl+C to stop.')
 
-touched = len(files)
-raw_score = round((touched / total_project) * 10)
-score = max(1, min(10, raw_score))
+    def cleanup(sig, frame):
+        shutdown_event.set()
+        _remove_pidfile()
+        server.shutdown()
+        sys.exit(0)
 
-if score <= 3:
-    desc = 'Minimal activity'
-elif score <= 6:
-    desc = 'Moderate activity'
-elif score <= 8:
-    desc = 'Significant activity'
-else:
-    desc = 'High activity'
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    try:
+        server.serve_forever()
+    finally:
+        _remove_pidfile()
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+files, tools, web, total_calls, session_topic = parse_session(session_file)
+score, total_project, touched, sensitive_files, drift_files, scope_val = calc_blast_radius(files)
+
+if mode == 'html':
+    html = generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic)
+    out_path = f'/tmp/session-map-{int(time.time())}.html'
+    with open(out_path, 'w') as f:
+        f.write(html)
+    open_cmd = 'xdg-open' if sys.platform == 'linux' else 'open'
+    try:
+        subprocess.Popen([open_cmd, out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f'Opened {out_path}')
+    except Exception:
+        print(f'Report ready: file://{out_path}')
+    sys.exit(0)
+
+if mode == 'live':
+    start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic)
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
-# Sensitive files
+# Terminal output (default)
 # ---------------------------------------------------------------------------
 
-sensitive_files = []
-for p in files:
-    match = is_sensitive(p)
-    if match:
-        sensitive_files.append(p)
-
-# ---------------------------------------------------------------------------
-# Scope drift
-# ---------------------------------------------------------------------------
-
-scope = scope_override or cwd
-if not scope.endswith('/'):
-    scope += '/'
-
-drift_files = []
-for p in files:
-    resolved = p if p.startswith('/') else os.path.join(cwd, p)
-    if not resolved.startswith(scope) and resolved != scope.rstrip('/'):
-        if not is_safe_dir(resolved) and not resolved.startswith(claude_prefix):
-            drift_files.append(p)
-
-# ---------------------------------------------------------------------------
-# Render: blast radius box
-# ---------------------------------------------------------------------------
+desc = 'Minimal activity' if score <= 3 else 'Moderate activity' if score <= 6 else 'Significant activity' if score <= 8 else 'High activity'
 
 lines = []
 box_w = 36
-lines.append('╔' + '═' * box_w + '╗')
-score_text = f'📊 BLAST RADIUS: {score}/10'
+lines.append('\u2554' + '\u2550' * box_w + '\u2557')
+score_text = f'\U0001f4ca BLAST RADIUS: {score}/10'
 score_pad = box_w - 2 - len(score_text)
 desc_pad = box_w - 2 - len(desc) - 1
-lines.append('║ ' + score_text + ' ' * max(0, score_pad) + '║')
-lines.append('║  ' + desc + ' ' * max(0, desc_pad) + ' ║')
-lines.append('╚' + '═' * box_w + '╝')
+lines.append('\u2551 ' + score_text + ' ' * max(0, score_pad) + '\u2551')
+lines.append('\u2551  ' + desc + ' ' * max(0, desc_pad) + ' \u2551')
+lines.append('\u255a' + '\u2550' * box_w + '\u255d')
 lines.append('')
-
-# ---------------------------------------------------------------------------
-# Render: modified files list
-# ---------------------------------------------------------------------------
 
 if not files:
     lines.append('No file activity found in this session.')
 else:
     sorted_files = sorted(files.items(), key=lambda x: (x[1]['writes'] + x[1]['creates'] + x[1]['deletes']) * 3 + x[1]['reads'], reverse=True)
 
-    lines.append('📁 Files Touched:')
+    lines.append('\U0001f4c1 Files Touched:')
     for p, act in sorted_files:
         edits = act['writes'] + act['creates'] + act['deletes']
         reads = act['reads']
-        sens = is_sensitive(p)
-
-        if sens:
-            sym = '⚠'
-        elif act['creates'] > 0:
-            sym = '+'
-        elif act['deletes'] > 0:
-            sym = '-'
-        elif act['writes'] > 0:
-            sym = '●'
-        else:
-            sym = '○'
-
+        sym = file_sym(act)
         display = rel_path(p)
         parts = []
         if edits > 0:
@@ -315,7 +737,7 @@ else:
     lines.append('')
 
     if sensitive_files:
-        lines.append('  ⚠️  SENSITIVE FILES:')
+        lines.append('  \u26a0\ufe0f  SENSITIVE FILES:')
         for p in sensitive_files:
             act = files[p]
             if act['creates'] > 0:
@@ -328,15 +750,12 @@ else:
         lines.append('')
 
     if drift_files:
-        lines.append('  ⚡ SCOPE DRIFT:')
+        lines.append('  \u26a1 SCOPE DRIFT:')
         for p in drift_files:
             lines.append(f'     {p}')
         lines.append('')
 
-# ---------------------------------------------------------------------------
-# Render: file tree
-# ---------------------------------------------------------------------------
-
+# File tree
 if files:
     project_name = os.path.basename(cwd)
 
@@ -353,8 +772,8 @@ if files:
         keys = sorted(node.keys(), key=lambda k: (not k.endswith('/'), k))
         for i, key in enumerate(keys):
             is_last = (i == len(keys) - 1)
-            connector = '└── ' if is_last else '├── '
-            child_prefix = '    ' if is_last else '│   '
+            connector = '\u2514\u2500\u2500 ' if is_last else '\u251c\u2500\u2500 '
+            child_prefix = '    ' if is_last else '\u2502   '
             val = node[key]
 
             if isinstance(val, dict) and any(isinstance(v, dict) for v in val.values()):
@@ -364,18 +783,7 @@ if files:
                 act = val
                 edits = act['writes'] + act['creates'] + act['deletes']
                 reads = act['reads']
-                full_path = next((p for p in files if rel_path(p).endswith(key)), key)
-                sens = is_sensitive(full_path)
-                if sens:
-                    sym = '⚠'
-                elif act.get('creates', 0) > 0:
-                    sym = '+'
-                elif act.get('deletes', 0) > 0:
-                    sym = '-'
-                elif act.get('writes', 0) > 0:
-                    sym = '●'
-                else:
-                    sym = '○'
+                sym = file_sym(act)
 
                 parts = []
                 if edits > 0:
@@ -385,25 +793,22 @@ if files:
                 stats = f'  ({", ".join(parts)})' if parts else ''
                 lines.append(f'{prefix}{connector}{sym} {key}{stats}')
 
-    lines.append('🌳 File Tree:')
+    lines.append('\U0001f333 File Tree:')
     lines.append(f'  {project_name}/')
     render_tree(tree, '  ')
     lines.append('')
 
-# ---------------------------------------------------------------------------
-# Render: web activity
-# ---------------------------------------------------------------------------
-
+# Web activity
 if web:
     total_web = sum(v['count'] for v in web.values())
     domains = len(web)
-    lines.append(f'🌐 Web Activity ({plural(domains, "domain")}, {plural(total_web, "request")}):')
+    lines.append(f'\U0001f310 Web Activity ({plural(domains, "domain")}, {plural(total_web, "request")}):')
 
     if 'web-search' in web:
         ws = web['web-search']
         lines.append(f'  Searches ({plural(ws["count"], "query")}):')
         for q in ws['urls']:
-            lines.append(f'    🔍 "{q}"')
+            lines.append(f'    \U0001f50d "{q}"')
 
     for domain, info in sorted(
         ((d, v) for d, v in web.items() if d != 'web-search'),
@@ -411,31 +816,25 @@ if web:
     ):
         lines.append(f'  {domain} ({plural(info["count"], "request")}):')
         for url in info['urls']:
-            lines.append(f'    → {url}')
+            lines.append(f'    \u2192 {url}')
 
     lines.append('')
 
-# ---------------------------------------------------------------------------
-# Render: tool breakdown
-# ---------------------------------------------------------------------------
-
+# Tool breakdown
 if tools:
     sorted_tools = sorted(tools.items(), key=lambda x: x[1], reverse=True)
     max_count = sorted_tools[0][1] if sorted_tools else 1
 
-    lines.append(f'🔧 Tool Calls ({total_calls}):')
+    lines.append(f'\U0001f527 Tool Calls ({total_calls}):')
     for name, count in sorted_tools:
         bar_len = max(1, round((count / max_count) * 20))
-        bar = '█' * bar_len
+        bar = '\u2588' * bar_len
         lines.append(f'  {name:<14} {bar} {count}')
     lines.append('')
 
-# ---------------------------------------------------------------------------
-# Render: footer
-# ---------------------------------------------------------------------------
-
+# Footer
 sid = session_id[:8] if len(session_id) > 8 else session_id
-lines.append('─' * 50)
+lines.append('\u2500' * 50)
 lines.append(f'Session: {sid}  |  Calls: {total_calls}  |  Files: {touched}')
 
 print('\n'.join(lines))
