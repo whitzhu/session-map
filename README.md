@@ -2,7 +2,9 @@
 
 What did Claude touch? A zero-dependency Claude Code skill that shows exactly what happened in your session — blast radius score, interactive file tree, heatmap, sensitive file alerts, scope drift warnings, and web activity tracking.
 
-![Terminal output](https://github.com/user-attachments/assets/166c5c73-5644-4a06-a013-7613852ae52f)
+| Terminal (`/session-map`) | HTML (`/session-map --html`) |
+|:---:|:---:|
+| ![Terminal](https://github.com/user-attachments/assets/166c5c73-5644-4a06-a013-7613852ae52f) | ![HTML](https://github.com/user-attachments/assets/e75f9bb4-0273-4b3a-a4a1-bdf212bd0300) |
 
 ## Install
 
