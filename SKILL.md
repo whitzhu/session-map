@@ -22,7 +22,7 @@ Visualize what Claude touched in this session — blast radius, file tree, sensi
 
 - **Terminal** (default): Inline text report shown in the Claude session.
 - **HTML** (`--html`): Generates a static interactive HTML report with D3 treemap heatmap, collapsible file tree, tool breakdown, and scope drift visualization. Opens in browser. Shows "Static snapshot" indicator.
-- **Live** (`--live`): Starts a local HTTP server that auto-updates the HTML report every second as Claude works. Opens in browser. Shows green "Live" indicator. Keep it on another monitor to watch Claude in real time. Auto-shuts down after 120s of inactivity (configurable with `--timeout`). Reuses existing server if called again in the same directory.
+- **Live** (`--live`): Starts a local HTTP server that auto-updates the HTML report every second as Claude works. Opens in browser. Shows green "Live" indicator. Keep it on another monitor to watch Claude in real time. Auto-shuts down after 10 min of inactivity (configurable with `--timeout`). Reuses existing server if called again in the same directory.
 
 Flags can be combined: `/session-map --live --scope src/`
 

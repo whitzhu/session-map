@@ -23,7 +23,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 scope_override = None
 mode = 'terminal'  # terminal | html | live
-idle_timeout = 120  # seconds; 0 = never auto-shutdown
+idle_timeout = 600  # seconds; 0 = never auto-shutdown
 args = sys.argv[1:]
 i = 0
 while i < len(args):
@@ -155,12 +155,74 @@ def file_sym(act):
 # Parse session
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Bash path extraction (ported from session-map-visualizer/src/parser.ts)
+# ---------------------------------------------------------------------------
+
+_PATH_PREFIX = r'(?:/|\.\.?/)'
+_PATH_CHAR = r'[^\s;|&><\'"]+'
+
+def extract_bash_paths(command):
+    """Extract file paths from a bash command with write/delete classification."""
+    seen = {}  # path -> {path, write, delete}
+
+    def add(raw, is_write, is_delete):
+        p = raw.replace("'", '').replace('"', '').replace('(', '').replace(')', '').strip()
+        if not p or p == '/dev/null' or p.startswith('/dev/'):
+            return
+        if p in seen:
+            if is_write:
+                seen[p]['write'] = True
+            if is_delete:
+                seen[p]['delete'] = True
+            return
+        seen[p] = {'path': p, 'write': is_write, 'delete': is_delete}
+
+    # 1. Redirect targets: > /path, >> /path (WRITE)
+    for m in re.finditer(r'>{1,2}\s*(' + _PATH_PREFIX + _PATH_CHAR + ')', command):
+        add(m.group(1), True, False)
+
+    # 2. tee targets: tee [-a] /path (WRITE)
+    for m in re.finditer(r'\btee\s+(?:-[a-zA-Z]\s+)*(' + _PATH_PREFIX + _PATH_CHAR + ')', command):
+        add(m.group(1), True, False)
+
+    # 3. curl -o /path, wget -O /path (WRITE)
+    for m in re.finditer(r'\bcurl\b[^;|&]*?\s-o\s+(' + _PATH_PREFIX + _PATH_CHAR + ')', command):
+        add(m.group(1), True, False)
+    for m in re.finditer(r'\bwget\b[^;|&]*?\s-O\s+(' + _PATH_PREFIX + _PATH_CHAR + ')', command):
+        add(m.group(1), True, False)
+
+    # 4. rm [-rf] /path (DELETE)
+    if re.search(r'\brm\b', command):
+        for m in re.finditer(r'\brm\s+(?:-[a-zA-Z]+\s+)*(' + _PATH_PREFIX + r'[^\s;|&><\'"]+)', command):
+            add(m.group(1), False, True)
+
+    # 5. cp/mv: last path arg is WRITE, earlier paths are READ
+    if re.search(r'\b(?:cp|mv)\b', command):
+        cp_match = re.search(r'\b(?:cp|mv)\s+(?:-[a-zA-Z]+\s+)*(.*?)(?:[;|&]|$)', command)
+        if cp_match:
+            paths = re.findall(r'(' + _PATH_PREFIX + r'[^\s;|&><\'"]+)', cp_match.group(1))
+            if len(paths) >= 2:
+                for p in paths[:-1]:
+                    add(p, False, False)
+                add(paths[-1], True, False)
+
+    # 6. Remaining paths not yet seen -> default to READ
+    for m in re.finditer(r'(?:^|\s)(' + _PATH_PREFIX + _PATH_CHAR + ')', command):
+        p = m.group(1).replace("'", '').replace('"', '').strip()
+        if p and p not in seen:
+            add(p, False, False)
+
+    return list(seen.values())
+
+
 def parse_session(sf):
     files = {}
     tools = {}
     web = {}
     total_calls = 0
     first_user_message = None
+    session_start_ts = None
 
     def track_file(path, activity):
         if not is_real_path(path):
@@ -168,7 +230,7 @@ def parse_session(sf):
         if path.startswith(claude_prefix):
             return
         if path not in files:
-            sens = is_sensitive(path)
+            sens = None if is_safe_dir(path) else is_sensitive(path)
             files[path] = {
                 'reads': 0, 'writes': 0, 'creates': 0, 'deletes': 0,
                 'isSensitive': bool(sens), 'sensitiveReason': sens or None,
@@ -196,6 +258,10 @@ def parse_session(sf):
                 record = json.loads(line)
             except Exception:
                 continue
+
+            # Capture session start time
+            if session_start_ts is None and record.get('timestamp'):
+                session_start_ts = record['timestamp']
 
             # Extract first user message as session topic
             if record.get('type') == 'user' and first_user_message is None:
@@ -236,11 +302,14 @@ def parse_session(sf):
                     track_file(inp.get('file_path', ''), 'writes')
                 elif name == 'Bash':
                     cmd = inp.get('command', '')
-                    for m in re.finditer(r'>{1,2}\s*((?:/|\.\.?/)[^\s;|&]+)', cmd):
-                        track_file(m.group(1), 'writes')
-                    if re.search(r'\brm\b', cmd):
-                        for m in re.finditer(r'\brm\s+(?:-[a-zA-Z]+\s+)*((?:/|\.\.?/)[^\s;|&]+)', cmd):
-                            track_file(m.group(1), 'deletes')
+                    bash_paths = extract_bash_paths(cmd)
+                    for bp in bash_paths:
+                        if bp['delete']:
+                            track_file(bp['path'], 'deletes')
+                        elif bp['write']:
+                            track_file(bp['path'], 'writes')
+                        else:
+                            track_file(bp['path'], 'reads')
                     for m in re.finditer(r'https?://[^\s\'"<>]+', cmd):
                         url = m.group(0).rstrip(')')
                         track_web(extract_domain(url), url)
@@ -259,7 +328,75 @@ def parse_session(sf):
         topic = first_user_message.strip().split('\n')[0]
         session_topic = (topic[:77] + '...') if len(topic) > 80 else topic
 
-    return files, tools, web, total_calls, session_topic
+    return files, tools, web, total_calls, session_topic, session_start_ts
+
+# ---------------------------------------------------------------------------
+# Git activity
+# ---------------------------------------------------------------------------
+
+def get_git_activity(since_ts):
+    """Get commits and uncommitted changes since the session started."""
+    commits = []
+    uncommitted = []
+
+    # Commits since session start
+    if since_ts:
+        try:
+            result = subprocess.run(
+                ['git', 'log', f'--since={since_ts}', '--format=%H%n%s%n%an%n%aI%n---'],
+                capture_output=True, text=True, cwd=cwd
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                chunks = result.stdout.strip().split('---\n')
+                for chunk in chunks:
+                    chunk = chunk.strip().rstrip('---').strip()
+                    if not chunk:
+                        continue
+                    parts = chunk.split('\n')
+                    if len(parts) >= 4:
+                        sha, msg, author, date = parts[0], parts[1], parts[2], parts[3]
+                        # Get diffstat for this commit
+                        stat_result = subprocess.run(
+                            ['git', 'diff', '--shortstat', f'{sha}~1..{sha}'],
+                            capture_output=True, text=True, cwd=cwd
+                        )
+                        stat = stat_result.stdout.strip() if stat_result.returncode == 0 else ''
+                        commits.append({
+                            'sha': sha[:8],
+                            'message': msg,
+                            'author': author,
+                            'date': date,
+                            'stat': stat,
+                        })
+        except Exception:
+            pass
+
+    # Uncommitted changes
+    try:
+        result = subprocess.run(
+            ['git', 'diff', '--stat', 'HEAD'],
+            capture_output=True, text=True, cwd=cwd
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if line and '|' in line:
+                    uncommitted.append(line)
+
+        # Also staged changes
+        result2 = subprocess.run(
+            ['git', 'diff', '--stat', '--cached'],
+            capture_output=True, text=True, cwd=cwd
+        )
+        if result2.returncode == 0 and result2.stdout.strip():
+            for line in result2.stdout.strip().split('\n'):
+                line = line.strip()
+                if line and '|' in line and line not in uncommitted:
+                    uncommitted.append(line)
+    except Exception:
+        pass
+
+    return commits, uncommitted
 
 # ---------------------------------------------------------------------------
 # Blast radius calculation
@@ -358,7 +495,7 @@ def build_file_tree(files):
 
     return root
 
-def serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None):
+def serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None, commits=None, uncommitted=None):
     """Serialize session data into the format expected by the HTML template."""
     file_activity = [_make_activity_entry(path, act) for path, act in files.items()]
 
@@ -391,6 +528,8 @@ def serialize_session_data(files, tools, web, total_calls, score, total_project,
         'generatedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'tree': build_file_tree(files),
         'sessionTopic': topic,
+        'gitCommits': commits or [],
+        'gitUncommitted': uncommitted or [],
     }
 
 def blast_color_var(score):
@@ -409,13 +548,13 @@ def blast_desc(score):
         return 'Significant'
     return 'High'
 
-def generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=False, topic=None):
-    """Generate the HTML report by reading template and substituting data."""
-    template_path = os.path.join(SCRIPT_DIR, 'template.html')
-    with open(template_path, 'r') as f:
-        template = f.read()
+def generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=False, topic=None, commits=None, uncommitted=None, template=None):
+    """Generate the HTML report by substituting data into the template."""
+    if template is None:
+        with open(os.path.join(SCRIPT_DIR, 'template.html'), 'r') as f:
+            template = f.read()
 
-    data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic)
+    data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic, commits=commits, uncommitted=uncommitted)
     data_json = json.dumps(data, default=str)
     data_b64 = base64.b64encode(data_json.encode('utf-8')).decode('ascii')
 
@@ -496,7 +635,7 @@ def _check_existing_server():
         _remove_pidfile()
         return None
 
-def start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None):
+def start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None, commits=None, uncommitted=None):
     """Start a live-updating HTTP server using only Python stdlib."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import threading, signal
@@ -514,25 +653,47 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
             pass
         return
 
-    current_html = [generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=True, topic=topic)]
-    subscribers = []
+    # Cache template at startup — no need to re-read from disk every tick
+    template_path = os.path.join(SCRIPT_DIR, 'template.html')
+    with open(template_path, 'r') as f:
+        cached_template = f.read()
+
+    current_html = [generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=True, topic=topic, commits=commits, uncommitted=uncommitted, template=cached_template)]
+    subscribers = set()
     subscribers_lock = threading.Lock()
     shutdown_event = threading.Event()
     session_ended = [False]
+    watcher_idle = [False]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
-            pass  # suppress request logs
+            pass
+
+        def handle(self):
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
 
         def do_GET(self):
-            if self.path == '/':
+            # DNS rebinding protection — reject requests with unexpected Host headers
+            host = (self.headers.get('Host') or '').split(':')[0]
+            if host not in ('127.0.0.1', 'localhost', ''):
+                self.send_response(421)
+                self.end_headers()
+                return
+
+            # Strip query string for path matching
+            path = self.path.split('?')[0]
+
+            if path == '/':
                 content = current_html[0].encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
                 self.send_header('Content-Length', str(len(content)))
                 self.end_headers()
                 self.wfile.write(content)
-            elif self.path == '/events':
+            elif path == '/events':
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Cache-Control', 'no-cache')
@@ -542,7 +703,7 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
 
                 event = threading.Event()
                 with subscribers_lock:
-                    subscribers.append(event)
+                    subscribers.add(event)
                 try:
                     while not shutdown_event.is_set():
                         fired = event.wait(timeout=25)
@@ -559,7 +720,6 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
                             if session_ended[0]:
                                 break
                         else:
-                            # SSE keepalive — prevents browser from closing idle connections
                             try:
                                 self.wfile.write(b': keepalive\n\n')
                                 self.wfile.flush()
@@ -569,83 +729,96 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
                     pass
                 finally:
                     with subscribers_lock:
-                        if event in subscribers:
-                            subscribers.remove(event)
+                        subscribers.discard(event)
             else:
                 self.send_response(404)
                 self.end_headers()
 
-    # Find available port (start at 7377 to avoid common dev server ports)
+    class ThreadedHTTPServer(HTTPServer):
+        daemon_threads = True
+
+        def server_bind(self):
+            import socket as _socket
+            self.socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+            super().server_bind()
+
+        def process_request(self, request, client_address):
+            t = threading.Thread(target=self._handle_request, args=(request, client_address), daemon=True)
+            t.start()
+
+        def _handle_request(self, request, client_address):
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                pass
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+
+    # Find available port
     port = 7377
     server = None
     for p in range(7377, 7388):
         try:
-            server = HTTPServer(('127.0.0.1', p), Handler)
+            server = ThreadedHTTPServer(('127.0.0.1', p), Handler)
             port = p
             break
         except OSError:
             continue
 
     if not server:
-        print('No available ports in range 7377-7387')
+        print('No available ports in range 7377-7387. Kill other session-map servers or use a different port range.')
         sys.exit(1)
 
-    # Write PID file so future invocations can find us
     _write_pidfile(os.getpid(), port)
 
-    # Cache project file count — doesn't change mid-session
     cached_total_project = [total_project]
-
-    # File watcher thread with session-end detection
     last_mtime = [os.path.getmtime(session_file)]
     last_change_time = [time.time()]
+
+    def notify_subscribers():
+        with subscribers_lock:
+            for event in subscribers:
+                event.set()
 
     def watch_file():
         while not shutdown_event.is_set():
             time.sleep(1)
             try:
-                # Check if session file still exists
                 if not os.path.exists(session_file):
-                    print('Session file removed. Shutting down.')
+                    print('Session file removed.')
                     session_ended[0] = True
-                    shutdown_event.set()
-                    with subscribers_lock:
-                        for event in subscribers:
-                            event.set()
-                    server.shutdown()
+                    _remove_pidfile()
+                    notify_subscribers()
                     return
 
                 mtime = os.path.getmtime(session_file)
                 if mtime > last_mtime[0]:
                     last_mtime[0] = mtime
                     last_change_time[0] = time.time()
-                    # Re-parse and regenerate (reuse cached project file count)
-                    f, t, w, tc, _topic = parse_session(session_file)
+
+                    if watcher_idle[0]:
+                        watcher_idle[0] = False
+                        print('Session activity resumed.')
+
+                    f, t, w, tc, _topic, _ts = parse_session(session_file)
                     s, tp, tch, sens, dr, sv = calc_blast_radius(f, cached_project_count=cached_total_project[0])
-                    current_html[0] = generate_html(f, t, w, tc, s, tp, tch, sens, dr, sv, live=True)
-                    # Notify all SSE subscribers
-                    with subscribers_lock:
-                        for event in subscribers:
-                            event.set()
-                elif idle_timeout > 0:
-                    # Check for idle timeout (session likely ended)
+                    gc, gu = get_git_activity(_ts)
+                    current_html[0] = generate_html(f, t, w, tc, s, tp, tch, sens, dr, sv, live=True, commits=gc, uncommitted=gu, template=cached_template)
+                    notify_subscribers()
+
+                elif idle_timeout > 0 and not watcher_idle[0]:
                     idle_seconds = time.time() - last_change_time[0]
                     if idle_seconds > idle_timeout:
-                        print(f'No session activity for {idle_timeout}s. Auto-shutting down.')
-                        session_ended[0] = True
-                        shutdown_event.set()
-                        with subscribers_lock:
-                            for event in subscribers:
-                                event.set()
-                        server.shutdown()
-                        return
-            except Exception:
-                pass
+                        print(f'No session activity for {idle_timeout}s. Pausing watcher (server stays alive).')
+                        watcher_idle[0] = True
+            except Exception as e:
+                print(f'[session-map] watcher error: {e}', file=sys.stderr)
 
     watcher = threading.Thread(target=watch_file, daemon=True)
     watcher.start()
 
-    # Open browser
     url = f'http://127.0.0.1:{port}'
     open_cmd = 'xdg-open' if sys.platform == 'linux' else 'open'
     try:
@@ -654,34 +827,32 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
         pass
 
     print(f'Live mode: {url}')
-    if idle_timeout > 0:
-        print(f'Auto-stops after {idle_timeout}s of inactivity. Use --timeout 0 to disable.')
-    else:
-        print('Auto-shutdown disabled. Ctrl+C to stop.')
+    print('Server stays alive until Ctrl+C. Watcher pauses after inactivity, resumes on new activity.')
 
+    # Signal handling — set event and let main thread handle shutdown
     def cleanup(sig, frame):
         shutdown_event.set()
-        _remove_pidfile()
-        server.shutdown()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
     try:
-        server.serve_forever()
+        while not shutdown_event.is_set():
+            server.handle_request()
     finally:
         _remove_pidfile()
+        server.server_close()
 
 # ===========================================================================
 # Main
 # ===========================================================================
 
-files, tools, web, total_calls, session_topic = parse_session(session_file)
+files, tools, web, total_calls, session_topic, session_start = parse_session(session_file)
+git_commits, git_uncommitted = get_git_activity(session_start)
 score, total_project, touched, sensitive_files, drift_files, scope_val = calc_blast_radius(files)
 
 if mode == 'html':
-    html = generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic)
+    html = generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic, commits=git_commits, uncommitted=git_uncommitted)
     out_path = f'/tmp/session-map-{int(time.time())}.html'
     with open(out_path, 'w') as f:
         f.write(html)
@@ -694,7 +865,7 @@ if mode == 'html':
     sys.exit(0)
 
 if mode == 'live':
-    start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic)
+    start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic, commits=git_commits, uncommitted=git_uncommitted)
     sys.exit(0)
 
 # ---------------------------------------------------------------------------
@@ -830,6 +1001,21 @@ if tools:
         bar_len = max(1, round((count / max_count) * 20))
         bar = '\u2588' * bar_len
         lines.append(f'  {name:<14} {bar} {count}')
+    lines.append('')
+
+# Git activity
+if git_commits or git_uncommitted:
+    lines.append('\U0001f4cb Git Activity:')
+    if git_commits:
+        lines.append(f'  Commits ({len(git_commits)}):')
+        for c in git_commits:
+            lines.append(f'    {c["sha"]}  {c["message"]}')
+            if c.get('stat'):
+                lines.append(f'             {c["stat"]}')
+    if git_uncommitted:
+        lines.append(f'  Uncommitted changes:')
+        for line in git_uncommitted:
+            lines.append(f'    {line}')
     lines.append('')
 
 # Footer

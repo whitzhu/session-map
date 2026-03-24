@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Files Touched &mdash; {{SESSION_ID}}</title>
+<title>Session Map &mdash; {{SESSION_ID}}</title>
 <!-- D3 loaded from CDN for treemap heatmap. Report works offline except the heatmap. -->
 <script src="https://unpkg.com/d3@7/dist/d3.min.js"></script>
 <style>
@@ -52,7 +52,7 @@ html, body {
   border-bottom: 1px solid var(--border);
 }
 #rpt-title-group { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-#rpt-label   { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+#rpt-label   { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--text); text-transform: uppercase; letter-spacing: 1px; }
 #rpt-session-topic { font-family: var(--mono); font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 500px; }
 #rpt-session { font-family: var(--mono); font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -201,6 +201,20 @@ details.t-dir[open] > summary .t-cbadge { display: none; }
   min-height: 24px; position: absolute; top: 0; left: 0; right: 0; z-index: 1;
 }
 
+/* ---- Git activity section ---- */
+#rpt-git { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }
+.git-title { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--text); letter-spacing: 0.3px; margin-bottom: 10px; }
+.git-subtitle { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--text-dim); margin: 12px 0 6px; }
+.git-commit { padding: 6px 8px; border-radius: 3px; margin-bottom: 4px; font-family: var(--mono); font-size: 11px; }
+.git-commit:hover { background: var(--surface2); }
+.git-sha { color: var(--readonly); margin-right: 8px; }
+.git-msg { color: var(--text); }
+.git-meta { color: var(--text-muted); font-size: 10px; margin-top: 2px; }
+.git-stat { color: var(--text-muted); font-size: 10px; }
+.git-diff-line { font-family: var(--mono); font-size: 11px; color: var(--text-dim); padding: 1px 8px; }
+.git-adds { color: var(--created); }
+.git-dels { color: var(--deleted); }
+
 #rpt-footer {
   margin-top: 28px; padding-top: 20px;
   border-top: 1px solid var(--border);
@@ -308,7 +322,7 @@ details.t-dir[open] > summary .t-cbadge { display: none; }
 
   <header id="rpt-header">
     <div id="rpt-title-group">
-      <span id="rpt-label">Files Touched &mdash; what did Claude touch?</span>
+      <span id="rpt-label">Session Map &mdash; what did Claude touch?</span>
       <span id="rpt-session-topic"></span>
       <span id="rpt-session">session {{SESSION_ID}} &middot; {{CWD}}</span>
     </div>
@@ -347,7 +361,6 @@ details.t-dir[open] > summary .t-cbadge { display: none; }
   </section>
 
   <section id="rpt-web"></section>
-  <section id="rpt-tools"></section>
 
   <section id="rpt-heatmap">
     <div id="rpt-heatmap-header">
@@ -366,6 +379,9 @@ details.t-dir[open] > summary .t-cbadge { display: none; }
       <div id="inline-treemap-wrap" style="position:absolute;top:24px;left:0;right:0;bottom:0;"></div>
     </div>
   </section>
+
+  <section id="rpt-tools"></section>
+  <section id="rpt-git"></section>
 
   <footer id="rpt-footer"></footer>
 
@@ -897,14 +913,128 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
         }
         if (urls.length > maxShow) {
           var moreEl = document.createElement('div');
-          moreEl.style.color = 'var(--text-muted)';
+          moreEl.style.cssText = 'color:var(--text-muted);cursor:pointer;';
           moreEl.textContent = '+ ' + (urls.length - maxShow) + ' more';
+          (function(wrap, allUrls, shown, trigger, isDomain) {
+            trigger.addEventListener('click', function() {
+              trigger.remove();
+              for (var ri = shown; ri < allUrls.length; ri++) {
+                var el = document.createElement('div');
+                if (isDomain === 'web-search') {
+                  el.className = 'web-search-query';
+                  el.textContent = '\u201C' + allUrls[ri] + '\u201D';
+                } else {
+                  var a = document.createElement('a');
+                  a.href = allUrls[ri]; a.target = '_blank'; a.rel = 'noopener';
+                  a.textContent = allUrls[ri].length > 80 ? allUrls[ri].substring(0, 80) + '\u2026' : allUrls[ri];
+                  a.title = allUrls[ri];
+                  el.appendChild(a);
+                }
+                wrap.appendChild(el);
+              }
+            });
+          })(urlWrap, urls, maxShow, moreEl, wd.domain);
           urlWrap.appendChild(moreEl);
         }
         webSec.appendChild(urlWrap);
       }
     } else {
       webSec.style.display = 'none';
+    }
+
+    // Git activity
+    var gitSec = document.getElementById('rpt-git');
+    var gitCommits = data.gitCommits || [];
+    var gitUncommitted = data.gitUncommitted || [];
+    if (gitCommits.length > 0 || gitUncommitted.length > 0) {
+      var gt = document.createElement('div');
+      gt.className = 'git-title';
+      gt.textContent = 'Git activity';
+      gitSec.appendChild(gt);
+
+      if (gitCommits.length > 0) {
+        var cs = document.createElement('div');
+        cs.className = 'git-subtitle';
+        cs.textContent = 'Commits during session (' + gitCommits.length + ')';
+        gitSec.appendChild(cs);
+
+        for (var ci = 0; ci < gitCommits.length; ci++) {
+          var c = gitCommits[ci];
+          var row = document.createElement('div');
+          row.className = 'git-commit';
+
+          var sha = document.createElement('span');
+          sha.className = 'git-sha';
+          sha.textContent = c.sha;
+          row.appendChild(sha);
+
+          var msg = document.createElement('span');
+          msg.className = 'git-msg';
+          msg.textContent = c.message;
+          row.appendChild(msg);
+
+          if (c.stat) {
+            var stat = document.createElement('div');
+            stat.className = 'git-meta';
+            stat.textContent = c.stat;
+            row.appendChild(stat);
+          }
+
+          var meta = document.createElement('div');
+          meta.className = 'git-meta';
+          meta.textContent = c.author + ' \u00B7 ' + (c.date || '').replace('T', ' ').split('+')[0];
+          row.appendChild(meta);
+
+          gitSec.appendChild(row);
+        }
+      }
+
+      if (gitUncommitted.length > 0) {
+        var us = document.createElement('div');
+        us.className = 'git-subtitle';
+        us.textContent = 'Uncommitted changes';
+        gitSec.appendChild(us);
+
+        for (var ui = 0; ui < gitUncommitted.length; ui++) {
+          var dl = document.createElement('div');
+          dl.className = 'git-diff-line';
+          var raw = gitUncommitted[ui];
+          // Parse "file | N ++" format
+          var pipeIdx = raw.indexOf('|');
+          if (pipeIdx > 0) {
+            var fname = document.createElement('span');
+            fname.textContent = raw.substring(0, pipeIdx + 1);
+            fname.style.color = 'var(--text-dim)';
+            dl.appendChild(fname);
+            var rest = raw.substring(pipeIdx + 1);
+            var addMatch = rest.match(/(\d+)\s*(\+*)/);
+            var delMatch = rest.match(/(-+)/);
+            if (addMatch) {
+              var numSpan = document.createElement('span');
+              numSpan.textContent = ' ' + addMatch[1] + ' ';
+              numSpan.style.color = 'var(--text-muted)';
+              dl.appendChild(numSpan);
+              if (addMatch[2]) {
+                var addSpan = document.createElement('span');
+                addSpan.className = 'git-adds';
+                addSpan.textContent = addMatch[2];
+                dl.appendChild(addSpan);
+              }
+            }
+            if (delMatch) {
+              var delSpan = document.createElement('span');
+              delSpan.className = 'git-dels';
+              delSpan.textContent = delMatch[1];
+              dl.appendChild(delSpan);
+            }
+          } else {
+            dl.textContent = raw;
+          }
+          gitSec.appendChild(dl);
+        }
+      }
+    } else {
+      gitSec.style.display = 'none';
     }
 
     // Footer
@@ -1241,27 +1371,97 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
     if (liveDot) liveDot.style.background = 'hsl(140, 60%, 45%)';
     document.getElementById('live-status-text').textContent = 'Live';
     var lastUpdated = Date.now();
-    setInterval(function() {
+    var errorCount = 0;
+    var stopped = false;
+    var statusInterval = null;
+
+    function goStatic(reason) {
+      if (stopped) return;
+      stopped = true;
+      if (evtSource) evtSource.close();
+      if (statusInterval) clearInterval(statusInterval);
+      var now = new Date();
+      var timeStr = now.toLocaleTimeString();
+      var dot = document.getElementById('live-dot');
+      if (dot) dot.style.background = 'hsl(220,10%,45%)';
+      var el = document.getElementById('live-status-text');
+      if (el) el.textContent = reason + ' \u00B7 ' + timeStr;
+      document.title = '[' + reason + '] ' + document.title;
+      showRestartHint();
+    }
+
+    function showRestartHint() {
+      var container = document.getElementById('live-status');
+      if (!container) return;
+      var btn = document.createElement('button');
+      btn.textContent = 'Reconnect';
+      btn.title = 'Try to reconnect, or copy command to restart';
+      btn.style.cssText = 'background:none;border:1px solid var(--border);color:var(--text-dim);font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:3px;cursor:pointer;margin-left:8px;';
+      btn.addEventListener('mouseenter', function() { btn.style.borderColor = 'var(--text-muted)'; });
+      btn.addEventListener('mouseleave', function() { btn.style.borderColor = 'var(--border)'; });
+      btn.addEventListener('click', function() {
+        btn.textContent = 'Connecting...';
+        btn.disabled = true;
+        // Try to reach the server — if it's back, reload
+        fetch('/', { method: 'HEAD' }).then(function(resp) {
+          if (resp.ok) {
+            window.location.reload();
+          } else {
+            throw new Error('not ok');
+          }
+        }).catch(function() {
+          // Server is gone — offer the command
+          btn.textContent = 'Reconnect';
+          btn.disabled = false;
+          var cmd = '/session-map --live';
+          if (navigator.clipboard) {
+            navigator.clipboard.writeText(cmd).then(function() {
+              showToast('Server not running. Copied: ' + cmd);
+            });
+          } else {
+            showToast('Server not running. Run: ' + cmd);
+          }
+        });
+      });
+      container.appendChild(btn);
+    }
+
+    statusInterval = setInterval(function() {
+      if (stopped) return;
       var el = document.getElementById('live-status-text');
       if (!el) return;
       var ago = Math.round((Date.now() - lastUpdated) / 1000);
-      el.textContent = ago < 5 ? 'Live' : 'Updated ' + ago + 's ago';
+      var agoStr;
+      if (ago < 5) { agoStr = null; }
+      else if (ago < 60) { agoStr = ago + 's'; }
+      else if (ago < 3600) { var m = Math.floor(ago / 60); var s = ago % 60; agoStr = m + 'min' + (s > 0 ? ' ' + s + 's' : ''); }
+      else { var h = Math.floor(ago / 3600); var m2 = Math.floor((ago % 3600) / 60); agoStr = h + 'h' + (m2 > 0 ? ' ' + m2 + 'min' : ''); }
+      el.textContent = agoStr ? 'Updated ' + agoStr + ' ago' : 'Live';
     }, 1000);
+
     var evtSource = new EventSource('/events');
-    evtSource.onmessage = function() { lastUpdated = Date.now(); window.location.reload(); };
+
+    evtSource.onmessage = function() {
+      lastUpdated = Date.now();
+      errorCount = 0;
+      window.location.reload();
+    };
+
     evtSource.addEventListener('session-ended', function() {
-      document.title = '[Session ended] ' + document.title;
-      var dot = document.getElementById('live-dot');
-      if (dot) dot.style.background = 'hsl(0,60%,45%)';
-      var el = document.getElementById('live-status-text');
-      if (el) el.textContent = 'Session ended';
-      evtSource.close();
+      goStatic('Session ended');
     });
+
     evtSource.onerror = function() {
-      var dot = document.getElementById('live-dot');
-      if (dot) dot.style.background = 'hsl(35,65%,45%)';
-      var el = document.getElementById('live-status-text');
-      if (el) el.textContent = 'Connection lost. Retrying...';
+      errorCount++;
+      if (errorCount >= 3) {
+        // Server is gone — degrade gracefully to static
+        goStatic('Stopped');
+      } else {
+        var dot = document.getElementById('live-dot');
+        if (dot) dot.style.background = 'hsl(35,65%,45%)';
+        var el = document.getElementById('live-status-text');
+        if (el) el.textContent = 'Reconnecting... (' + errorCount + '/3)';
+      }
     };
   }
 
