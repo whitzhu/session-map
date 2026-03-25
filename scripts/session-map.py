@@ -70,14 +70,15 @@ def _try_encodings(path):
     return None
 
 def find_project_dir():
-    """Find the Claude project dir for cwd, walking up to parent dirs."""
+    """Find the Claude project dir for cwd, walking up to parent dirs.
+    Stops at home directory to avoid scanning the entire filesystem."""
     path = cwd
     while True:
         result = _try_encodings(path)
         if result:
             return result
         parent = os.path.dirname(path)
-        if parent == path:
+        if parent == path or path == home:
             break
         path = parent
     return None
@@ -258,6 +259,7 @@ def parse_session(sf, state=None):
         files = state['files']
         tools = state['tools']
         web = state['web']
+        skills = state['skills']
         total_calls = state['total_calls']
         first_user_message = state['first_user_message']
         session_start_ts = state['session_start_ts']
@@ -267,6 +269,7 @@ def parse_session(sf, state=None):
         files = {}
         tools = {}
         web = {}
+        skills = {}
         total_calls = 0
         first_user_message = None
         session_start_ts = None
@@ -378,6 +381,10 @@ def parse_session(sf, state=None):
                     q = inp.get('query', '')
                     if q:
                         track_web('web-search', q)
+                elif name == 'Skill':
+                    skill_name = inp.get('skill', '')
+                    if skill_name:
+                        skills[skill_name] = skills.get(skill_name, 0) + 1
 
         new_offset = fh.tell()
 
@@ -394,12 +401,12 @@ def parse_session(sf, state=None):
         session_topic = (topic[:77] + '...') if len(topic) > 80 else topic
 
     parse_state = {
-        'files': files, 'tools': tools, 'web': web,
+        'files': files, 'tools': tools, 'web': web, 'skills': skills,
         'total_calls': total_calls, 'first_user_message': first_user_message,
         'session_start_ts': session_start_ts, 'file_offset': new_offset,
         'git_tracked': git_tracked,
     }
-    return files, tools, web, total_calls, session_topic, session_start_ts, parse_state
+    return files, tools, web, skills, total_calls, session_topic, session_start_ts, parse_state
 
 # ---------------------------------------------------------------------------
 # Git activity
@@ -481,8 +488,14 @@ def calc_blast_radius(files, cached_project_count=None):
         if total_project == 0:
             try:
                 result = subprocess.run(
-                    ['find', '.', '-type', 'f', '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.*'],
-                    capture_output=True, text=True, cwd=cwd
+                    ['find', '.', '-type', 'f',
+                     '-not', '-path', '*/node_modules/*',
+                     '-not', '-path', '*/.*',
+                     '-not', '-path', '*/vendor/*',
+                     '-not', '-path', '*/__pycache__/*',
+                     '-not', '-path', '*/venv/*',
+                     '-not', '-path', '*/.venv/*'],
+                    capture_output=True, text=True, cwd=cwd, timeout=5
                 )
                 total_project = len([l for l in result.stdout.strip().split('\n') if l])
             except Exception:
@@ -492,8 +505,11 @@ def calc_blast_radius(files, cached_project_count=None):
             total_project = 1
 
     touched = len(files)
-    raw_score = round((touched / total_project) * 10)
-    score = max(1, min(10, raw_score))
+    if touched == 0:
+        score = 0
+    else:
+        raw_score = round((touched / total_project) * 10)
+        score = max(1, min(10, raw_score))
 
     sensitive = [p for p, act in files.items() if act.get('isSensitive')]
 
@@ -562,7 +578,7 @@ def build_file_tree(files):
 
     return root
 
-def serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None, commits=None, uncommitted=None):
+def serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None, commits=None, uncommitted=None, skills=None):
     """Serialize session data into the format expected by the HTML template."""
     file_activity = [_make_activity_entry(path, act) for path, act in files.items()]
 
@@ -597,6 +613,7 @@ def serialize_session_data(files, tools, web, total_calls, score, total_project,
         'sessionTopic': topic,
         'gitCommits': commits or [],
         'gitUncommitted': uncommitted or [],
+        'skills': skills or {},
     }
 
 def blast_color_var(score):
@@ -607,6 +624,8 @@ def blast_color_var(score):
     return 'var(--deleted)'
 
 def blast_desc(score):
+    if score == 0:
+        return 'No files touched'
     if score <= 3:
         return 'Minimal'
     if score <= 6:
@@ -615,13 +634,13 @@ def blast_desc(score):
         return 'Significant'
     return 'High'
 
-def generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=False, topic=None, commits=None, uncommitted=None, template=None):
+def generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=False, topic=None, commits=None, uncommitted=None, skills=None, template=None):
     """Generate the HTML report by substituting data into the template."""
     if template is None:
         with open(os.path.join(SCRIPT_DIR, 'template.html'), 'r') as f:
             template = f.read()
 
-    data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic, commits=commits, uncommitted=uncommitted)
+    data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic, commits=commits, uncommitted=uncommitted, skills=skills)
     data_json = json.dumps(data, default=str)
     data_b64 = base64.b64encode(data_json.encode('utf-8')).decode('ascii')
 
@@ -702,7 +721,7 @@ def _check_existing_server():
         _remove_pidfile()
         return None
 
-def start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None, commits=None, uncommitted=None):
+def start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=None, commits=None, uncommitted=None, skills=None, parse_state=None):
     """Start a live-updating HTTP server using only Python stdlib."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import threading, signal
@@ -725,9 +744,9 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
     with open(template_path, 'r') as f:
         cached_template = f.read()
 
-    initial_data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic, commits=commits, uncommitted=uncommitted)
+    initial_data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic, commits=commits, uncommitted=uncommitted, skills=skills)
     current_data_json = [json.dumps(initial_data, default=str)]
-    current_html = [generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=True, topic=topic, commits=commits, uncommitted=uncommitted, template=cached_template)]
+    current_html = [generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=True, topic=topic, commits=commits, uncommitted=uncommitted, skills=skills, template=cached_template)]
     subscribers = set()
     subscribers_lock = threading.Lock()
     shutdown_event = threading.Event()
@@ -852,9 +871,10 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
     cached_total_project = [total_project]
     last_mtime = [os.path.getmtime(session_file)]
     last_change_time = [time.time()]
-    # Initial parse state for incremental parsing
-    _, _, _, _, _, _, initial_state = parse_session(session_file)
-    live_parse_state = [initial_state]
+    # Use provided parse state or do initial parse
+    if parse_state is None:
+        _, _, _, _, _, _, _, parse_state = parse_session(session_file)
+    live_parse_state = [parse_state]
 
     def notify_subscribers():
         with subscribers_lock:
@@ -881,13 +901,13 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
                         watcher_idle[0] = False
                         print('Session activity resumed.')
 
-                    f, t, w, tc, _topic, _ts, new_state = parse_session(session_file, state=live_parse_state[0])
+                    f, t, w, sk, tc, _topic, _ts, new_state = parse_session(session_file, state=live_parse_state[0])
                     live_parse_state[0] = new_state
                     s, tp, tch, sens, dr, sv = calc_blast_radius(f, cached_project_count=cached_total_project[0])
                     gc, gu = get_git_activity(_ts)
-                    new_data = serialize_session_data(f, t, w, tc, s, tp, tch, sens, dr, sv, topic=_topic, commits=gc, uncommitted=gu)
+                    new_data = serialize_session_data(f, t, w, tc, s, tp, tch, sens, dr, sv, topic=_topic, commits=gc, uncommitted=gu, skills=sk)
                     current_data_json[0] = json.dumps(new_data, default=str)
-                    current_html[0] = generate_html(f, t, w, tc, s, tp, tch, sens, dr, sv, live=True, commits=gc, uncommitted=gu, template=cached_template)
+                    current_html[0] = generate_html(f, t, w, tc, s, tp, tch, sens, dr, sv, live=True, commits=gc, uncommitted=gu, skills=sk, template=cached_template)
                     notify_subscribers()
 
                 elif idle_timeout > 0 and not watcher_idle[0]:
@@ -929,12 +949,12 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
 # Main
 # ===========================================================================
 
-files, tools, web, total_calls, session_topic, session_start, _ = parse_session(session_file)
+files, tools, web, skills, total_calls, session_topic, session_start, initial_parse_state = parse_session(session_file)
 git_commits, git_uncommitted = get_git_activity(session_start)
 score, total_project, touched, sensitive_files, drift_files, scope_val = calc_blast_radius(files)
 
 if mode == 'html':
-    html = generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic, commits=git_commits, uncommitted=git_uncommitted)
+    html = generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic, commits=git_commits, uncommitted=git_uncommitted, skills=skills)
     out_path = f'/tmp/session-map-{int(time.time())}.html'
     with open(out_path, 'w') as f:
         f.write(html)
@@ -947,14 +967,14 @@ if mode == 'html':
     sys.exit(0)
 
 if mode == 'live':
-    start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic, commits=git_commits, uncommitted=git_uncommitted)
+    start_live_server(files, tools, web, total_calls, score, total_project, touched, sensitive_files, drift_files, scope_val, topic=session_topic, commits=git_commits, uncommitted=git_uncommitted, skills=skills, parse_state=initial_parse_state)
     sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # Terminal output (default)
 # ---------------------------------------------------------------------------
 
-desc = 'Minimal activity' if score <= 3 else 'Moderate activity' if score <= 6 else 'Significant activity' if score <= 8 else 'High activity'
+desc = 'No files touched' if score == 0 else 'Minimal activity' if score <= 3 else 'Moderate activity' if score <= 6 else 'Significant activity' if score <= 8 else 'High activity'
 
 lines = []
 box_w = 36
@@ -1073,12 +1093,19 @@ if web:
 
     lines.append('')
 
+# Skills used
+if skills:
+    lines.append(f'\U0001f9e9 Skills Used ({len(skills)}):')
+    for skill_name, count in sorted(skills.items(), key=lambda x: x[1], reverse=True):
+        lines.append(f'  {skill_name}' + (f'  \u00d7{count}' if count > 1 else ''))
+    lines.append('')
+
 # Tool breakdown
 if tools:
     sorted_tools = sorted(tools.items(), key=lambda x: x[1], reverse=True)
     max_count = sorted_tools[0][1] if sorted_tools else 1
 
-    lines.append(f'\U0001f527 Tool Calls ({total_calls}):')
+    lines.append(f'\U0001f527 Activity ({total_calls}):')
     for name, count in sorted_tools:
         bar_len = max(1, round((count / max_count) * 20))
         bar = '\u2588' * bar_len
@@ -1103,6 +1130,6 @@ if git_commits or git_uncommitted:
 # Footer
 sid = session_id[:8] if len(session_id) > 8 else session_id
 lines.append('\u2500' * 50)
-lines.append(f'Session: {sid}  |  Calls: {total_calls}  |  Files: {touched}')
+lines.append(f'Session: {sid}  |  Actions: {total_calls}  |  Files: {touched}')
 
 print('\n'.join(lines))

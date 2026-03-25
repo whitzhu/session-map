@@ -380,6 +380,7 @@ details.t-dir[open] > summary .t-cbadge { display: none; }
     </div>
   </section>
 
+  <section id="rpt-skills"></section>
   <section id="rpt-tools"></section>
   <section id="rpt-git"></section>
 
@@ -526,13 +527,14 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
   }
 
   function clearDynamicSections() {
-    var ids = ['blast-stats', 'rpt-issues', 'files-legend', 'files-list', 'rpt-tools', 'rpt-web', 'rpt-git', 'rpt-footer'];
+    var ids = ['blast-stats', 'rpt-issues', 'files-legend', 'files-list', 'rpt-skills', 'rpt-tools', 'rpt-web', 'rpt-git', 'rpt-footer'];
     for (var i = 0; i < ids.length; i++) {
       var el = document.getElementById(ids[i]);
-      if (el) { while (el.firstChild) el.removeChild(el.firstChild); }
+      if (el) {
+        while (el.firstChild) el.removeChild(el.firstChild);
+        el.style.display = '';
+      }
     }
-    var issues = document.getElementById('rpt-issues');
-    if (issues) issues.style.display = '';
   }
 
   function initReport(data) {
@@ -557,7 +559,7 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
     if (statsEl) {
       var toolLink = document.createElement('span');
       toolLink.className = 'blast-link';
-      toolLink.textContent = data.totalToolCalls + ' tool calls';
+      toolLink.textContent = data.totalToolCalls + ' actions';
       toolLink.title = 'Jump to tool breakdown';
       toolLink.addEventListener('click', function() {
         var t = document.getElementById('rpt-tools');
@@ -859,6 +861,35 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
 
     buildDirEl(buildDirTree(files), list, '', false, true);
 
+    // Skills used
+    var skillsSec = document.getElementById('rpt-skills');
+    var skillsData = data.skills || {};
+    var skillKeys = Object.keys(skillsData);
+    if (skillKeys.length > 0) {
+      skillKeys.sort(function(a, b) { return skillsData[b] - skillsData[a]; });
+      var st = document.createElement('div');
+      st.className = 'tools-title';
+      st.textContent = '\uD83E\uDDE9 Skills used (' + skillKeys.length + ')';
+      skillsSec.appendChild(st);
+      for (var si = 0; si < skillKeys.length; si++) {
+        var sName = skillKeys[si], sCount = skillsData[sName];
+        var sRow = document.createElement('div');
+        sRow.className = 'tool-row';
+        var sNameEl = document.createElement('span');
+        sNameEl.className = 'tool-name';
+        sNameEl.textContent = sName;
+        sRow.appendChild(sNameEl);
+        var sCountEl = document.createElement('span');
+        sCountEl.className = 'tool-count';
+        sCountEl.style.color = 'var(--text-dim)';
+        sCountEl.textContent = sCount > 1 ? '\u00d7' + sCount : '';
+        sRow.appendChild(sCountEl);
+        skillsSec.appendChild(sRow);
+      }
+    } else {
+      skillsSec.style.display = 'none';
+    }
+
     // Tool breakdown
     var toolsSec = document.getElementById('rpt-tools');
     var tb = data.toolBreakdown || {};
@@ -868,7 +899,7 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
       var maxTool = tb[tbKeys[0]] || 1;
       var tt = document.createElement('div');
       tt.className = 'tools-title';
-      tt.textContent = 'Tool calls (' + data.totalToolCalls + ')';
+      tt.textContent = 'Activity (' + data.totalToolCalls + ')';
       toolsSec.appendChild(tt);
       var toolColors = {
         Read: 'var(--readonly)', Glob: 'var(--readonly)', Grep: 'var(--readonly)',
@@ -1068,7 +1099,7 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
     addStat('read-only', fread, 'var(--readonly)');
     addStat('modified', fmod, 'var(--modified)');
     addStat('created', fcre, 'var(--created)');
-    addStat('tool calls', data.totalToolCalls, 'var(--text)');
+    addStat('actions', data.totalToolCalls, 'var(--text)');
     if (data.blast.inferredScope) {
       var scope = document.createElement('span');
       scope.className = 'footer-stat';
