@@ -54,10 +54,24 @@ while i < len(args):
 
 cwd = os.getcwd()
 home = os.path.expanduser('~')
-encoded = cwd.replace('/', '-')
-project_dir = os.path.join(home, '.claude', 'projects', encoded)
+projects_root = os.path.join(home, '.claude', 'projects')
 
-if not os.path.isdir(project_dir):
+def find_project_dir():
+    """Find the Claude project dir for cwd, handling encoding variations."""
+    # Try exact encoding variants
+    for encoder in [
+        lambda p: p.replace('/', '-'),
+        lambda p: p.replace('/', '-').replace('_', '-'),
+        lambda p: p.replace('/', '-').replace(' ', '-'),
+        lambda p: p.replace('/', '-').replace('_', '-').replace(' ', '-'),
+    ]:
+        candidate = os.path.join(projects_root, encoder(cwd))
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+project_dir = find_project_dir()
+if not project_dir:
     print(f'No session found for {cwd}. Have you run a Claude Code session here?')
     sys.exit(1)
 
