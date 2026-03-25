@@ -336,6 +336,12 @@ def parse_session(sf):
                     if q:
                         track_web('web-search', q)
 
+    # If a file is marked as deleted but still exists, reclassify as write
+    for path, act in files.items():
+        if act['deletes'] > 0 and os.path.exists(path):
+            act['writes'] += act['deletes']
+            act['deletes'] = 0
+
     # Truncate to first line, cap at 80 chars for display
     session_topic = None
     if first_user_message:
