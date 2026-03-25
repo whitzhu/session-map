@@ -418,8 +418,15 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
 (function() {
   'use strict';
 
+  var isFirstRender = true;
+
   function animateBlastScore(target) {
     var el = document.getElementById('blast-score');
+    if (!isFirstRender) {
+      // Skip animation on live updates
+      el.textContent = target;
+      return;
+    }
     var start = null, duration = 400;
     function step(ts) {
       if (!start) start = ts;
@@ -518,8 +525,18 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
     }
   }
 
+  function clearDynamicSections() {
+    var ids = ['blast-stats', 'rpt-issues', 'files-legend', 'files-list', 'rpt-tools', 'rpt-web', 'rpt-git', 'rpt-footer'];
+    for (var i = 0; i < ids.length; i++) {
+      var el = document.getElementById(ids[i]);
+      if (el) { while (el.firstChild) el.removeChild(el.firstChild); }
+    }
+    var issues = document.getElementById('rpt-issues');
+    if (issues) issues.style.display = '';
+  }
+
   function initReport(data) {
-    if (data.homeDir) SAFE_DIR_PREFIXES.push(data.homeDir + '/.claude/');
+    if (data.homeDir && SAFE_DIR_PREFIXES.indexOf(data.homeDir + '/.claude/') === -1) SAFE_DIR_PREFIXES.push(data.homeDir + '/.claude/');
 
     var driftFiles     = data.blast.scopeDriftFiles  || [];
     var sensitiveFiles = data.blast.sensitiveFiles   || [];
@@ -1204,9 +1221,12 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
     var wrap = document.getElementById(wrapId);
     var bcBar = document.getElementById(bcBarId);
     if (!wrap) return;
-    if (wrap.dataset.rendered) return;
+    if (wrap.dataset.rendered) {
+      // Clear previous render for live updates
+      wrap.dataset.rendered = '';
+      while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    }
     wrap.dataset.rendered = '1';
-    wrap.textContent = '';
     var mono = "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace";
     var svg = d3.select(wrap).append('svg');
     var resizeObs = null;
@@ -1354,6 +1374,7 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
     animateBlastScore(SESSION_DATA.blast.score);
     initReport(SESSION_DATA);
     renderTreemap(SESSION_DATA, 'inline-treemap-wrap', 'inline-breadcrumb');
+    isFirstRender = false;
   } catch (err) {
     console.error('session-map render error:', err);
     var body = document.getElementById('report');
@@ -1444,7 +1465,32 @@ var SESSION_DATA = JSON.parse(atob('{{DATA_B64}}'));
     evtSource.onmessage = function() {
       lastUpdated = Date.now();
       errorCount = 0;
-      window.location.reload();
+      // Fetch updated data and re-render in place (no page reload)
+      fetch('/data').then(function(resp) { return resp.json(); }).then(function(newData) {
+        SESSION_DATA = newData;
+        isFirstRender = false;
+        clearDynamicSections();
+        animateBlastScore(newData.blast.score);
+        // Update blast label color/text
+        var blastLabel = document.getElementById('blast-label');
+        if (blastLabel) {
+          var s = newData.blast.score;
+          var colorVar = s <= 3 ? 'var(--created)' : s <= 6 ? 'var(--modified)' : 'var(--deleted)';
+          var desc = s <= 3 ? 'Minimal' : s <= 6 ? 'Moderate' : s <= 8 ? 'Significant' : 'High';
+          blastLabel.style.color = colorVar;
+          blastLabel.textContent = 'BLAST RADIUS \u00B7 ' + desc;
+          document.getElementById('blast-score').style.color = colorVar;
+        }
+        initReport(newData);
+        renderTreemap(newData, 'inline-treemap-wrap', 'inline-breadcrumb');
+        // Update live status
+        var el = document.getElementById('live-status-text');
+        if (el) el.textContent = 'Live';
+        var dot = document.getElementById('live-dot');
+        if (dot) dot.style.background = 'hsl(140, 60%, 45%)';
+      }).catch(function(err) {
+        console.error('session-map live update error:', err);
+      });
     };
 
     evtSource.addEventListener('session-ended', function() {

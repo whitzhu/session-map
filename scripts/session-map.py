@@ -230,13 +230,36 @@ def extract_bash_paths(command):
     return list(seen.values())
 
 
-def parse_session(sf):
-    files = {}
-    tools = {}
-    web = {}
-    total_calls = 0
-    first_user_message = None
-    session_start_ts = None
+def _build_git_tracked_set():
+    """Get set of absolute paths for all files tracked by git."""
+    try:
+        result = subprocess.run(['git', 'ls-files'], capture_output=True, text=True, cwd=cwd)
+        if result.returncode == 0:
+            return set(os.path.join(cwd, f) for f in result.stdout.strip().split('\n') if f)
+    except Exception:
+        pass
+    return set()
+
+def parse_session(sf, state=None):
+    """Parse session file. If state is provided, resume incrementally."""
+    if state:
+        files = state['files']
+        tools = state['tools']
+        web = state['web']
+        total_calls = state['total_calls']
+        first_user_message = state['first_user_message']
+        session_start_ts = state['session_start_ts']
+        file_offset = state['file_offset']
+        git_tracked = state['git_tracked']
+    else:
+        files = {}
+        tools = {}
+        web = {}
+        total_calls = 0
+        first_user_message = None
+        session_start_ts = None
+        file_offset = 0
+        git_tracked = _build_git_tracked_set()
 
     def track_file(path, activity):
         if not is_real_path(path):
@@ -264,6 +287,8 @@ def parse_session(sf):
             return url
 
     with open(sf, encoding='utf-8', errors='replace') as fh:
+        if file_offset > 0:
+            fh.seek(file_offset)
         for line in fh:
             line = line.strip()
             if not line:
@@ -309,9 +334,15 @@ def parse_session(sf):
                 elif name == 'Write':
                     p = inp.get('file_path', '')
                     if is_real_path(p):
-                        already = p in files
-                        exists = not already and os.path.exists(p)
-                        track_file(p, 'writes' if (already or exists) else 'creates')
+                        if p in files:
+                            # Already seen this session — modification
+                            track_file(p, 'writes')
+                        elif p in git_tracked:
+                            # Existed before this session (in git) — modification
+                            track_file(p, 'writes')
+                        else:
+                            # New file — create
+                            track_file(p, 'creates')
                 elif name in ('Edit', 'MultiEdit'):
                     track_file(inp.get('file_path', ''), 'writes')
                 elif name == 'Bash':
@@ -336,6 +367,8 @@ def parse_session(sf):
                     if q:
                         track_web('web-search', q)
 
+        new_offset = fh.tell()
+
     # If a file is marked as deleted but still exists, reclassify as write
     for path, act in files.items():
         if act['deletes'] > 0 and os.path.exists(path):
@@ -348,7 +381,13 @@ def parse_session(sf):
         topic = first_user_message.strip().split('\n')[0]
         session_topic = (topic[:77] + '...') if len(topic) > 80 else topic
 
-    return files, tools, web, total_calls, session_topic, session_start_ts
+    parse_state = {
+        'files': files, 'tools': tools, 'web': web,
+        'total_calls': total_calls, 'first_user_message': first_user_message,
+        'session_start_ts': session_start_ts, 'file_offset': new_offset,
+        'git_tracked': git_tracked,
+    }
+    return files, tools, web, total_calls, session_topic, session_start_ts, parse_state
 
 # ---------------------------------------------------------------------------
 # Git activity
@@ -360,27 +399,22 @@ def get_git_activity(since_ts):
     uncommitted = []
 
     # Commits since session start
-    if since_ts:
+    if since_ts and re.match(r'^[\d\-T:.Z+]+$', str(since_ts)):
         try:
             result = subprocess.run(
-                ['git', 'log', f'--since={since_ts}', '--format=%H%n%s%n%an%n%aI%n---'],
+                ['git', 'log', f'--since={since_ts}', '--format=---%n%H%n%s%n%an%n%aI', '--shortstat', '--'],
                 capture_output=True, text=True, cwd=cwd
             )
             if result.returncode == 0 and result.stdout.strip():
                 chunks = result.stdout.strip().split('---\n')
                 for chunk in chunks:
-                    chunk = chunk.strip().rstrip('---').strip()
+                    chunk = chunk.strip()
                     if not chunk:
                         continue
                     parts = chunk.split('\n')
                     if len(parts) >= 4:
                         sha, msg, author, date = parts[0], parts[1], parts[2], parts[3]
-                        # Get diffstat for this commit
-                        stat_result = subprocess.run(
-                            ['git', 'diff', '--shortstat', f'{sha}~1..{sha}'],
-                            capture_output=True, text=True, cwd=cwd
-                        )
-                        stat = stat_result.stdout.strip() if stat_result.returncode == 0 else ''
+                        stat = parts[4].strip() if len(parts) > 4 else ''
                         commits.append({
                             'sha': sha[:8],
                             'message': msg,
@@ -483,6 +517,9 @@ def build_file_tree(files):
     """Build a nested tree structure for the D3 treemap."""
     root = {'name': 'root', 'children': []}
 
+    # Use a dict index for O(1) child lookups instead of scanning lists
+    dir_index = {}  # (id(parent), name) -> child node
+
     for file_path, activity in files.items():
         parts = [s for s in file_path.split('/') if s]
         current = root
@@ -503,14 +540,12 @@ def build_file_tree(files):
             else:
                 if 'children' not in current:
                     current['children'] = []
-                child = None
-                for c in current['children']:
-                    if c.get('name') == part and 'children' in c:
-                        child = c
-                        break
+                key = (id(current), part)
+                child = dir_index.get(key)
                 if not child:
                     child = {'name': part, 'children': []}
                     current['children'].append(child)
+                    dir_index[key] = child
                 current = child
 
     return root
@@ -678,6 +713,8 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
     with open(template_path, 'r') as f:
         cached_template = f.read()
 
+    initial_data = serialize_session_data(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, topic=topic, commits=commits, uncommitted=uncommitted)
+    current_data_json = [json.dumps(initial_data, default=str)]
     current_html = [generate_html(files, tools, web, total_calls, score, total_project, touched, sensitive, drift, scope_val, live=True, topic=topic, commits=commits, uncommitted=uncommitted, template=cached_template)]
     subscribers = set()
     subscribers_lock = threading.Lock()
@@ -710,6 +747,13 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
                 content = current_html[0].encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+            elif path == '/data':
+                content = current_data_json[0].encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(content)))
                 self.end_headers()
                 self.wfile.write(content)
@@ -796,6 +840,9 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
     cached_total_project = [total_project]
     last_mtime = [os.path.getmtime(session_file)]
     last_change_time = [time.time()]
+    # Initial parse state for incremental parsing
+    _, _, _, _, _, _, initial_state = parse_session(session_file)
+    live_parse_state = [initial_state]
 
     def notify_subscribers():
         with subscribers_lock:
@@ -822,9 +869,12 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
                         watcher_idle[0] = False
                         print('Session activity resumed.')
 
-                    f, t, w, tc, _topic, _ts = parse_session(session_file)
+                    f, t, w, tc, _topic, _ts, new_state = parse_session(session_file, state=live_parse_state[0])
+                    live_parse_state[0] = new_state
                     s, tp, tch, sens, dr, sv = calc_blast_radius(f, cached_project_count=cached_total_project[0])
                     gc, gu = get_git_activity(_ts)
+                    new_data = serialize_session_data(f, t, w, tc, s, tp, tch, sens, dr, sv, topic=_topic, commits=gc, uncommitted=gu)
+                    current_data_json[0] = json.dumps(new_data, default=str)
                     current_html[0] = generate_html(f, t, w, tc, s, tp, tch, sens, dr, sv, live=True, commits=gc, uncommitted=gu, template=cached_template)
                     notify_subscribers()
 
@@ -867,7 +917,7 @@ def start_live_server(files, tools, web, total_calls, score, total_project, touc
 # Main
 # ===========================================================================
 
-files, tools, web, total_calls, session_topic, session_start = parse_session(session_file)
+files, tools, web, total_calls, session_topic, session_start, _ = parse_session(session_file)
 git_commits, git_uncommitted = get_git_activity(session_start)
 score, total_project, touched, sensitive_files, drift_files, scope_val = calc_blast_radius(files)
 
