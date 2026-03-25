@@ -56,18 +56,30 @@ cwd = os.getcwd()
 home = os.path.expanduser('~')
 projects_root = os.path.join(home, '.claude', 'projects')
 
-def find_project_dir():
-    """Find the Claude project dir for cwd, handling encoding variations."""
-    # Try exact encoding variants
+def _try_encodings(path):
+    """Try encoding variants for a given path."""
     for encoder in [
         lambda p: p.replace('/', '-'),
         lambda p: p.replace('/', '-').replace('_', '-'),
         lambda p: p.replace('/', '-').replace(' ', '-'),
         lambda p: p.replace('/', '-').replace('_', '-').replace(' ', '-'),
     ]:
-        candidate = os.path.join(projects_root, encoder(cwd))
+        candidate = os.path.join(projects_root, encoder(path))
         if os.path.isdir(candidate):
             return candidate
+    return None
+
+def find_project_dir():
+    """Find the Claude project dir for cwd, walking up to parent dirs."""
+    path = cwd
+    while True:
+        result = _try_encodings(path)
+        if result:
+            return result
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
     return None
 
 project_dir = find_project_dir()
